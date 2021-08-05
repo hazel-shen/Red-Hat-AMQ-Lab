@@ -1,0 +1,28 @@
+# Kafka Connect
+cat <<EOF | oc apply -f -
+apiVersion: kafka.strimzi.io/v1alpha1
+kind: KafkaConnect
+metadata:
+  name: my-connect
+spec:
+  replicas: 1
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 200m
+    limits:
+      memory: 2Gi
+      cpu: 500m
+  readinessProbe:
+    initialDelaySeconds: 120
+    timeoutSeconds: 5
+  livenessProbe:
+    initialDelaySeconds: 120
+    timeoutSeconds: 5
+  bootstrapServers: my-cluster-kafka-bootstrap:9092
+  config:
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.storage.StringConverter
+    key.converter.schemas.enable: false
+    value.converter.schemas.enable: false
+EOF
