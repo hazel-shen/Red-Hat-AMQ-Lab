@@ -1,0 +1,203 @@
+## Enabled User Workload Monitoring
+#### Ref: [Red Hat 官方文件] https://access.redhat.com/documentation/en-us/red_hat_amq/2021.q2/html/deploying_and_upgrading_amq_streams_on_openshift/assembly-metrics-setup-str
+```
+## 先 Enabled User Workload Monitoring
+cat << EOF | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+EOF
+
+# 把 Grafana 加入權限
+oc adm policy add-cluster-role-to-user cluster-monitoring-view -z grafana-serviceaccount
+
+## 觀察OpenShift workload 部署完畢與否
+oc get po -n openshift-user-workload-monitoring -w
+```
+
+```
+https://github.com/strimzi/strimzi-kafka-operator/tree/main/examples/metrics
+```
+## 安裝 Strimzi Pod Monitor 監控 Kafka Cluster
+```
+wget https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/main/examples/metrics/prometheus-install/strimzi-pod-monitor.yaml
+cat strimzi-pod-monitor.yaml | sed "s#myproject#amq-monitor#g" | oc apply -n amq-monitor -f -
+```
+
+## 建立 Grafana Dashboard
+
+```
+oc create namespace streams-grafana
+
+cat << EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: grafana-group
+  namespace: streams-grafana
+  labels:
+    app: grafana
+spec:
+  targetNamespaces:
+    - streams-grafana
+EOF
+
+cat << EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: grafana-operator
+  namespace:  streams-grafana
+spec:
+  channel: alpha
+  installPlanApproval: Automatic
+  name: grafana-operator
+  source: community-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: grafana-operator.v3.10.3
+EOF
+```
+
+## 連結Prometheus 與 Grafana
+```
+cat << EOF | oc apply -f -
+apiVersion: integreatly.org/v1alpha1
+kind: Grafana
+metadata:
+  name: grafana
+  namespace: streams-grafana
+spec:
+  ingress:
+    enabled: True
+  config:
+    log:
+      mode: "console"
+      level: "warn"
+    security:
+      admin_user: "admin"
+      admin_password: "admin"
+    auth:
+      disable_login_form: False
+      disable_signout_menu: True
+    auth.anonymous:
+      enabled: True
+  dashboardLabelSelector:
+    - matchExpressions:
+        - { key: app, operator: In, values: [strimzi] }
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 8000Mi
+    requests:
+      cpu: 100m
+      memory: 200Mi
+EOF
+```
+
+```
+cat << EOF | oc apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grafana-serviceaccount
+  labels:
+    app: strimzi
+    namespace: streams-grafana
+EOF
+
+cat << EOF | oc apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: grafana-cluster-monitoring-binding
+  labels:
+    app: strimzi
+subjects:
+  - kind: ServiceAccount
+    name: grafana-serviceaccount
+    namespace: streams-monitoring
+roleRef:
+  kind: ClusterRole
+  name: cluster-monitoring-view
+  apiGroup: rbac.authorization.k8s.io
+EOF
+```
+
+```
+export TOKEN=$(oc serviceaccounts get-token grafana-serviceaccount -n streams-grafana)
+echo $TOKEN
+
+cat << EOF | oc apply -f -
+apiVersion: integreatly.org/v1alpha1
+kind: GrafanaDataSource
+metadata:
+  name: grafanadatasource
+  namespace: streams-grafana
+spec:
+  name: middleware.yaml
+  datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+      basicAuth: true
+      basicAuthPassword: $TOKEN
+      basicAuthUser: internal
+      isDefault: true
+      version: 1
+      editable: true
+      jsonData:
+        tlsSkipVerify: true
+        timeInterval: "5s"
+EOF
+
+cat << EOF | oc apply -f -
+apiVersion: integreatly.org/v1alpha1
+kind: GrafanaDataSource
+metadata:
+  name: prometheus-grafanadatasource
+  namespace: streams-grafana
+spec:
+  datasources:
+    - access: proxy
+      editable: true
+      isDefault: true
+      jsonData:
+        httpHeaderName1: 'Authorization'
+        timeInterval: 5s
+        tlsSkipVerify: true
+      name: Prometheus
+      secureJsonData:
+        httpHeaderValue1: 'Bearer ${BEARER_TOKEN}'
+      type: prometheus
+      url: 'thanos-querier-openshift-monitoring.apps.cluster-06d1.06d1.sandbox1842.opentlc.com'
+  name: prometheus-grafanadatasource.yaml
+EOF
+
+```
+
+## Set Up Grafana Dashboard
+Ref: https://github.com/strimzi/strimzi-kafka-operator/blob/main/examples/metrics/grafana-dashboards/strimzi-kafka-exporter.json
+```
+cat << EOF > /tmp/dashboard.yaml
+apiVersion: integreatly.org/v1alpha1
+kind: GrafanaDashboard
+metadata:
+  labels:
+    app: strimzi
+    monitoring-key: middleware
+  name: strimzi-operators
+  namespace: streams-grafana
+spec:
+  name: strimzi-operators.json
+  json: |
+    PLACEHOLDER
+EOF
+
+DATA="$(jq 'del(.__inputs,.__requires)'  https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/main/examples/metrics/grafana-dashboards/strimzi-kafka-exporter.json)" yq eval ".spec.json = strenv(DATA)" /tmp/dashboard.yaml | sed -e '/DS_PROMETHEUS/d' | oc apply -f -
+```
